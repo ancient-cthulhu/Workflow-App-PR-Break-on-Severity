@@ -202,34 +202,7 @@ CVSS scores map to bands using the standard Veracode banding:
 
 -----
 
-## Local Testing
-
-Validate the gate against a saved report before relying on it in CI. Exit `1` means it would break the build, `0` means pass.
-
-```bash
-# SCA: save an agent log as scaResults.txt
-python3 helper/cli/veracode_severity_gate.py --mode sca --input scaResults.txt --threshold medium
-echo $?
-
-# IaC: produce JSON with the bundled CLI, then gate
-./veracode scan --type directory --source ./ --format json --output veracode-iac-results.json
-python3 helper/cli/veracode_severity_gate.py --mode iac --input veracode-iac-results.json --threshold high
-```
-
-Add `--warn-only` to see the report without a non-zero exit while tuning the threshold.
-
-Run the unit tests (standard library only, no dependencies):
-
-```bash
-cd helper/cli
-python3 -m unittest discover -s tests -p 'test_*.py'
-```
-
-The suite covers CVSS banding, effective-severity escalation, the secret floor, threshold validation, numeric exact comparison, fail-closed behavior on missing/empty/malformed input, SCA reconciliation, and output sanitization.
-
------
-
-## Fleet-Wide Rollout
+## Bulk Rollout
 
 If you manage many orgs with the bulk GitHub Workflow Integration tool, the threshold config in `veracode.yml` can be pushed across the fleet with `--update-veracode-yml`:
 
