@@ -1,0 +1,299 @@
+name: Veracode Static Pipeline Scanner
+
+on:
+  workflow_call:
+    inputs:
+      policy_name:
+        required: true
+        type: string
+      owner:
+        required: true
+        type: string
+      repo:
+        required: true
+        type: string
+      sha:
+        required: true
+        type: string
+      token:
+        required: true
+        type: string
+      ref:
+        required: true
+        type: string
+      create_code_scanning_alert:
+        required: true
+        type: boolean
+      create_issue:
+        required: true
+        type: boolean
+      check_run_id:
+        required: true
+        type: string
+      source_repository:
+          required: true
+          type: string
+      profile_name:
+          required: true
+          type: string
+      break_build_policy_findings: 
+          required: true
+          type: string
+      break_build_on_error: 
+          required: true
+          type: string
+      filter_mitigated_flaws: 
+          required: true
+          type: string
+      language:
+        required: true
+        type: string
+      default_runs_on:
+        required: true
+        type: string
+      debug:
+        required: false
+        type: string
+
+jobs:
+  prepare_pipeline_scan:
+    runs-on: ${{ fromJson(inputs.default_runs_on) }}
+    name: prepare pipeline scan
+    outputs:
+      matrix_files: ${{ steps.get-files.outputs.matrix_files }} 
+
+    steps:
+      - name: checkout repo
+        uses: actions/checkout@v6
+      
+      # get the compiled binary from a previous job
+      - name: get archive
+        uses: actions/download-artifact@v7
+        with:
+          name: veracode-artifact
+          path: ./veracode_artifact_directory
+
+      - name: Get list of files for matrix
+        id: get-files
+        run: |
+          files=$(ls -1 veracode_artifact_directory | jq -R . | jq -s .)
+          echo "Files for matrix: $files"
+          files=$(echo $files | jq -c .)  # Compact the JSON array to a single line
+          echo "matrix_files=$files" >> $GITHUB_OUTPUT
+        shell: bash
+
+  pipeline_scan:
+    runs-on: ${{ fromJson(inputs.default_runs_on) }}
+    needs: prepare_pipeline_scan
+    strategy:
+      matrix:
+        file: ${{fromJson(needs.prepare_pipeline_scan.outputs.matrix_files)}}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.owner }}/${{ inputs.repo }}
+          ref: ${{ inputs.ref }}
+          token: ${{ inputs.token }}
+
+      - name: get archive
+        uses: actions/download-artifact@v7
+        with:
+          name: veracode-artifact
+          path: ./veracode_artifact_directory
+      - name: Debug Matrix Content
+        run: |
+          echo "Raw matrix files: ${{ needs.prepare_pipeline_scan.outputs.matrix_files }}"
+          echo "Current Matrix: ${{ matrix }}"
+          echo "Current File: ${{ matrix.file }}"
+
+      - name: Veracode Pipeline-Scan
+        if: always()
+        id: pipeline-scan
+        uses: veracode/Veracode-pipeline-scan-action@v1.0.22
+        with:
+          vid: ${{ secrets.VERACODE_API_ID }}
+          vkey: ${{ secrets.VERACODE_API_KEY }}
+          veracode_policy_name: ${{ inputs.policy_name }}
+          file: ./veracode_artifact_directory/${{ matrix.file }}
+          fail_build: ${{ inputs.break_build_policy_findings }}
+          summary_output: true
+          summary_output_file: ${{ strategy.job-index }}-results.txt
+          json_output: true
+          json_output_file: ${{ strategy.job-index }}-results.json
+          filtered_json_output_file: ${{ strategy.job-index }}-filtered_results.json
+          artifact_name: ${{ matrix.file }}
+          debug: ${{ inputs.debug == true && '1' || '0' }}
+          workflow_app: true
+    
+      - name: Veracode Pipeline Results
+        if: always()
+        id: prepare-results
+        uses: veracode/github-actions-integration-helper@v0.1.10
+        with:
+          action: 'preparePipelineResults'
+          token: ${{ inputs.token }}
+          check_run_id: ${{ inputs.check_run_id }}
+          vid: ${{ secrets.VERACODE_API_ID }}
+          vkey: ${{ secrets.VERACODE_API_KEY }}
+          appname: ${{ inputs.profile_name }}
+          source_repository: ${{ inputs.source_repository }}
+          fail_checks_on_policy: ${{ inputs.break_build_policy_findings }}
+          fail_checks_on_error: ${{ inputs.break_build_on_error }} 
+          filter_mitigated_flaws: ${{ inputs.filter_mitigated_flaws }}
+          filtered_results_file: ${{ strategy.job-index }}-filtered_results.json
+
+      - name: Convert pipeline scan output to SARIF format
+        if: ${{ inputs.create_code_scanning_alert && always() }}
+        uses: Veracode/veracode-pipeline-scan-results-to-sarif@v2.0.5
+        with:
+          pipeline-results-json: mitigated_${{ strategy.job-index }}-filtered_results.json
+          output-results-sarif: veracode-results.sarif
+          repo_owner: ${{ inputs.owner }}
+          repo_name: ${{ inputs.repo }}
+          commitSHA: ${{ inputs.sha }}
+          ref: ${{ inputs.ref }}
+          githubToken: ${{ inputs.token }}
+
+      - name: Create flaws as issues
+        if: ${{ inputs.create_issue && always() }}
+        uses: veracode/veracode-flaws-to-issues@v2.2.26
+        with:
+          scan-results-json: mitigated_${{ strategy.job-index }}-filtered_results.json
+          repo_owner: ${{ inputs.owner }}
+          github-token: ${{ inputs.token }}
+          repo_name: ${{ inputs.repo }}
+          commitHash: ${{ inputs.sha }}
+
+      # SEVERITY GATE (added): publish this matrix shard's filtered results so the
+      # pipeline_severity_gate job can aggregate findings across all shards.
+      - name: Upload pipeline results for the severity gate
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: veracode-pipeline-gate-${{ strategy.job-index }}
+          path: ${{ strategy.job-index }}-filtered_results.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+  # SEVERITY GATE (added): aggregate pipeline findings across all matrix shards,
+  # evaluate them against break_build_severity_threshold, and post the pipeline
+  # section of the consolidated PR scan-summary comment. Runs --warn-only so it
+  # only reports here; the existing policy break above is unchanged. Remove
+  # --warn-only to also break the build on the severity threshold.
+  pipeline_severity_gate:
+    runs-on: ${{ fromJson(inputs.default_runs_on) }}
+    needs: pipeline_scan
+    if: always()
+    steps:
+      - name: Download pipeline result shards
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          pattern: veracode-pipeline-gate-*
+          path: pipeline-gate-results
+          merge-multiple: true
+
+      - name: Check out severity gate and config
+        if: always()
+        uses: actions/checkout@v6
+        with:
+          path: veracode-helper
+          fetch-depth: 1
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            helper/cli/*
+            veracode.yml
+
+      - name: Veracode pipeline severity gate and PR comment
+        if: always()
+        shell: bash
+        env:
+          SECTION: veracode_static_scan
+          GH_TOKEN: ${{ inputs.token }}
+          SCAN_REPO: ${{ inputs.owner }}/${{ inputs.repo }}
+          PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          HEAD_SHA: ${{ inputs.sha }}
+          # The SAST dispatch SHA is not always a browsable commit, so link file
+          # locations to the branch instead, which always resolves on GitHub.
+          BLOB_REF: ${{ github.event.client_payload.repository.branch }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          USER_CONFIG_THRESHOLD: ${{ github.event.client_payload.user_config.break_build_severity_threshold }}
+          VAR_THRESHOLD: ${{ vars.VERACODE_FAIL_SEVERITY }}
+        run: |
+          set -uo pipefail
+
+          if [ ! -f veracode-helper/helper/cli/veracode_severity_gate.py ]; then
+            echo "::warning::Gate script not found; skipping pipeline severity gate."
+            exit 0
+          fi
+
+          read_threshold() {
+            awk -v section="$1" '
+              $0 ~ "^"section":[ \t]*$" {inblk=1; next}
+              /^[^[:space:]#]/ {inblk=0}
+              inblk && /^[ \t]*break_build_severity_threshold[ \t]*:/ {
+                line=$0
+                sub(/^[ \t]*break_build_severity_threshold[ \t]*:[ \t]*/, "", line)
+                sub(/#.*/, "", line)
+                print line; exit
+              }' "$2" 2>/dev/null | sed "s/[\"']//g" | sed "s/[[:space:]]*\$//"
+          }
+          THRESHOLD=""
+          [ -f veracode-helper/veracode.yml ] && THRESHOLD="$(read_threshold "$SECTION" veracode-helper/veracode.yml)"
+          [ -n "$THRESHOLD" ] || THRESHOLD="${USER_CONFIG_THRESHOLD:-}"
+          [ -n "$THRESHOLD" ] || THRESHOLD="${VAR_THRESHOLD:-}"
+          [ -n "$THRESHOLD" ] || THRESHOLD="medium"
+          echo "Resolved pipeline severity threshold: $THRESHOLD"
+
+          shopt -s nullglob
+          files=(pipeline-gate-results/*filtered_results.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::warning::No pipeline result files found; skipping pipeline severity gate and comment."
+            exit 0
+          fi
+
+          # Merge findings across all shards into one document for the gate.
+          python3 -c 'import json,glob; a=[]; [a.extend(json.load(open(f)).get("findings") or []) for f in glob.glob("pipeline-gate-results/*filtered_results.json")]; json.dump({"findings":a}, open("merged.json","w"))'
+
+          # --warn-only: report and post the comment section without breaking the
+          # build here. Remove it to also gate the build on the severity threshold.
+          python3 veracode-helper/helper/cli/veracode_severity_gate.py \
+            --mode pipeline --input merged.json --threshold "$THRESHOLD" \
+            --pr-comment pipeline --warn-only
+
+  update-checks-status:
+    runs-on: ${{ fromJson(inputs.default_runs_on) }}
+    needs: pipeline_scan
+    if: always()
+    steps:
+     - name: Update check
+       id: update_check_status
+       shell: bash
+       env:
+        BREAK_BUILD_ON_ERROR: ${{ inputs.break_build_on_error }}
+        BREAK_BUILD_ON_POLICY: ${{ inputs.break_build_policy_findings }}
+       run: |
+            success_count=0
+            conclusion="failure"
+            # Convert JSON string to a proper format for jq processing
+            echo '${{ toJSON(needs) }}' | jq -c 'to_entries[]' | while read -r job; do
+              status=$(echo "$job" | jq -r '.value.result')
+              echo "$status"
+              if [ "$status" = "success" ]; then
+                success_count=$((success_count + 1))
+                echo '{"status": "completed", "conclusion": "success"}' > payload.txt
+              elif [ "$status" = "failure" ]; then
+                if [ "$BREAK_BUILD_ON_ERROR" = "false" && "$BREAK_BUILD_ON_POLICY" = "false" ]; then
+                  echo '{"status": "completed", "conclusion": "success"}' > payload.txt
+                else
+                  echo '{"status": "completed", "conclusion": "failure"}' > payload.txt
+                fi
+              fi
+              curl -X PATCH \
+                -H "Authorization: Bearer ${{ inputs.token }}" \
+                -H "Accept: application/vnd.github+json" \
+                https://api.github.com/repos/${{ inputs.owner }}/${{ inputs.repo }}/check-runs/${{ inputs.check_run_id }} \
+                -d @"payload.txt"
+            done
