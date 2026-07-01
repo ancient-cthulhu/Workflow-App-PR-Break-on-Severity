@@ -202,23 +202,9 @@ CVSS scores map to bands using the standard Veracode banding:
 
 -----
 
-## Bulk Rollout
-
-If you manage many orgs with the bulk GitHub Workflow Integration tool, the threshold config in `veracode.yml` can be pushed across the fleet with `--update-veracode-yml`:
-
-```bash
-python script.py --apply --enterprise YOUR-ENTERPRISE \
-  --update-veracode-yml /path/to/veracode.yml
-```
-
-Note that `--update-veracode-yml` deploys only the `veracode.yml` file. The gate itself also needs the two modified workflow files and `helper/cli/veracode_severity_gate.py`. To roll the gate out fleet-wide, place those in the template the bulk tool imports from (the source for `--import-repo` and `--fix-repos`), so new and re-imported repos pick them up. Otherwise apply them per repo.
-
------
-
 ## Security Notes
 
 - No new secrets are introduced. The IaC CLI scan reuses the existing `VERACODE_API_ID` and `VERACODE_API_KEY` via HMAC environment variables.
-- Untrusted dispatch and variable values reach the shell only through `env:` indirection, never inline expression interpolation in a `run:` block, which avoids script injection.
 - The gate script has no network calls, no `subprocess`/shell usage, and no third-party dependencies. The threshold is passed as a single quoted argument and validated, so a hostile `veracode.yml` value cannot execute.
 - Finding text is sanitized (newlines and tabs collapsed, leading `::` neutralized, pipes escaped) before it reaches the Markdown summary or the log.
 - Scan artifacts (`scaResults.*`, results JSON) are git-ignored and the temp staging directory is removed on step exit.
