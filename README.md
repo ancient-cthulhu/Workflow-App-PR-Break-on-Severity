@@ -32,6 +32,7 @@ Copy these into your Veracode integration repo at the same paths.
 |----------------------------------------------|------------------------------------------------------------------------|
 |`veracode.yml`                                |Adds the documented `break_build_severity_threshold` key per scan type  |
 |`.github/workflows/veracode-sca-scan.yml`     |SCA workflow with the severity gate step (Linux and Windows)            |
+|`.github/workflows/veracode-pipeline-scan.yml`|SAST workflow with the severity gate step (Linux and Windows)           |
 |`.github/workflows/veracode-iac-secrets-scan.yml`|IaC/Secrets workflow with the deterministic re-scan and gate step    |
 |`helper/cli/veracode_severity_gate.py`        |The gate parser. Dependency-free, Python 3.8+                           |
 
