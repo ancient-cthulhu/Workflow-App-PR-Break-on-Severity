@@ -1,0 +1,148 @@
+veracode_static_scan:
+  push:
+    trigger: true
+    # Please only specify either branches_to_run or branches_to_exclude
+    # Entering both will only execute branches_to_run
+    # Leaving them both blank means this will never run
+    branches_to_run:
+    branches_to_exclude:
+      - default_branch 
+  pull_request:
+    trigger: true
+    action:
+      - opened
+      - synchronize
+    target_branch:
+      - default_branch 
+  # If the analysis_on_platform is set to true,
+  # Veracode will save your last scan result, on the default branch, as an application profile with the same name as your scanned repository on the Veracode platform. 
+  # If the analysis_on_platform is set to false, scan results will not be saved to the Veracode platform.
+  analysis_on_platform: true
+  # If break_build_policy_findings is set to true, the build will break when findings violate the policy.
+  break_build_policy_findings: true
+  # SEVERITY GATE (added): severity floor for the pipeline (SAST) scan's section
+  # in the consolidated PR scan-summary comment. The pipeline severity gate
+  # parses the pipeline scan findings and marks the comment section Passed or
+  # Failed against this level. By default it only reports (it does not add a new
+  # build break on top of the policy break above); remove --warn-only in the
+  # pipeline workflow's gate step to also break the build on this threshold.
+  # Accepts critical|high|medium|low|info or a CVSS number in [0, 10].
+  break_build_severity_threshold: medium
+  # If break_build_invalid_policy is set to true, the build will break when the policy name is invalid.
+  break_build_invalid_policy: true
+  # If the break_build_on_error is set to true, the build will break if the scan failed to complete in time or with an error and the error_message will be displayed.
+  break_build_on_error: false
+  error_message: "Veracode static scan faced a problem. Please contact your Veracode administrator for more information."
+  # Default policy to be used if a policy isn't already assigned to the application profile.
+  policy: 'testPolicy'
+  # If the create_code_scanning_alert is set to true, GitHub security code scanning vulnerability alerts will be created for static findings.
+  create_code_scanning_alert: false
+  # If the create_issue is set to true, GitHub Issues will be created for static findings.
+  create_issue: false
+  # If the trigger is set to true, a scan is triggered when you create an issue containing the commands value or add a comment containing the commands value to an issue.
+  # Syntax to be used - COMMANDS_VALUE [branch: BRANCH_NAME]
+  issues:
+    trigger: true
+    commands:
+      - "Veracode Static Scan"
+      - "Veracode All Scans"
+
+veracode_sca_scan:
+  push:
+    trigger: true
+    # Please only specify either branches_to_run or branches_to_exclude
+    # Entering both will only execute branches_to_run
+    # Leaving them both blank means this will never run
+    branches_to_run:
+      - '*'
+    branches_to_exclude:
+  pull_request:
+    trigger: true
+    action:
+      - opened
+      - synchronize
+    target_branch:
+      - default_branch
+
+  fix_for_sca:
+    # Fix for SCA configuration
+    pull_request:
+    # Setting trigger to true will enable Fix for SCA on pull requests. Fix for SCA requires SCA scans to be executed on these pull requests.
+    trigger: true
+  # If the break_build_on_error is set to true, the build will break if the scan failed to complete or with an error, no libraries were found, 
+  # or no build system was found and the error_message will be displayed.
+  break_build_on_error: true
+  break_build_policy_findings: true
+  # -------------------------------------------------------------------------
+  # break_build_severity_threshold (severity gate)
+  #
+  # The workflow runs a severity gate after the agent-based SCA scan. The gate
+  # parses the SCA results and FAILS the build when any vulnerability is at or
+  # above the level set here. Outdated-library issues are reported but do not
+  # break the build.
+  #
+  # Accepted values: critical | high | medium | low | info, or a CVSS number
+  # (for example 7.0). A number does an exact CVSS comparison; a name uses the
+  # standard band (critical >= 9.0, high 7.0-8.9, medium 4.0-6.9, low 0.1-3.9).
+  #
+  # How it is read: the gate step reads THIS key directly from veracode.yml at
+  # scan time (it is not passed through the Veracode dispatch payload).
+  # Resolution order, first non-empty wins:
+  #   1. veracode.yml in the scanned repo (per-repo override, if present)
+  #   2. this veracode.yml in the integration repo (org default)
+  #   3. the VERACODE_FAIL_SEVERITY GitHub Actions variable, if set
+  #   4. built-in default: medium
+  # -------------------------------------------------------------------------
+  break_build_severity_threshold: medium
+  error_message: "Veracode SCA scan faced a problem. Please contact your Veracode administrator for more information."
+  # If the trigger is set to true, a scan is triggered when you create an issue containing the commands value or add a comment containing the commands value to an issue.
+  # Syntax to be used - COMMANDS_VALUE [branch: BRANCH_NAME]
+  issues:
+    trigger: true
+    commands:
+      - "Veracode SCA Scan"
+      - "Veracode All Scans"
+
+veracode_iac_secrets_scan:
+  push:
+    trigger: true
+    # Please only specify either branches_to_run or branches_to_exclude
+    # Entering both will only execute branches_to_run
+    # Leaving them both blank means this will never run
+    branches_to_run:
+      - '*'
+    branches_to_exclude:
+  pull_request:
+    trigger: true
+    action:
+      - opened
+      - synchronize
+    target_branch:
+      - default_branch
+  # If break_build_policy_findings is set to true, the build will break when findings violate the policy.
+  break_build_policy_findings: true
+  # -------------------------------------------------------------------------
+  # break_build_severity_threshold (severity gate)
+  #
+  # IaC/Secrets scanning has no policy connection to application profiles, so
+  # the workflow runs a severity gate after the scan. The gate evaluates IaC
+  # misconfigurations, exposed secrets, and dependency vulnerabilities, and
+  # FAILS the build when any finding is at or above the level set here. Findings
+  # that already passed (status PASS) are ignored.
+  #
+  # Accepted values and resolution order are the same as documented in the
+  # veracode_sca_scan section above. Set a different level here to gate IaC
+  # independently of SCA (for example, gate IaC only on high and above).
+  # -------------------------------------------------------------------------
+  break_build_severity_threshold: high
+  # If the break_build_on_error is set to true, the build will break if the scan failed to complete or with an error, no libraries were found, 
+  # or no build system was found and the error_message will be displayed.
+  break_build_on_error: true
+  error_message: "Veracode IAC secrets scan faced a problem. Please contact your Veracode administrator for more information."
+  # If the trigger is set to true, a scan is triggered when you create an issue containing the commands value or add a comment containing the commands value to an issue.
+  # Syntax to be used - COMMANDS_VALUE [branch: BRANCH_NAME]
+  issues:
+    trigger: true
+    commands:
+      - "Veracode IAC Scan"
+      - "Veracode All Scans"
