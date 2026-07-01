@@ -1,4 +1,4 @@
-# Veracode Severity Gate for the GitHub Workflow Integration
+# Severity Gate for the Veracode GitHub Workflow Integration
 
 Adds a configurable, build-breaking severity gate to the Veracode GitHub Workflow Integration for agent-based SCA and IaC/Secrets scans. The overlay parses the scan results and fails the job when any finding is at or above a threshold you set in `veracode.yml`. Output is a rendered severity table in the job summary plus a failing annotation.
 
