@@ -34,7 +34,6 @@ Copy these into your Veracode integration repo at the same paths.
 |`.github/workflows/veracode-sca-scan.yml`     |SCA workflow with the severity gate step (Linux and Windows)            |
 |`.github/workflows/veracode-iac-secrets-scan.yml`|IaC/Secrets workflow with the deterministic re-scan and gate step    |
 |`helper/cli/veracode_severity_gate.py`        |The gate parser. Dependency-free, Python 3.8+                           |
-|`helper/cli/tests/test_gate.py`               |Unit tests for the gate (stdlib `unittest`, no dependencies)            |
 
 -----
 
