@@ -167,8 +167,13 @@ def id_url(ident: Optional[str]) -> Optional[str]:
         return f"https://cwe.mitre.org/data/definitions/{m.group(1)}.html"
     if re.match(r"^CVE-\d{4}-\d+$", s, re.IGNORECASE):
         return f"https://nvd.nist.gov/vuln/detail/{s.upper()}"
-    if re.match(r"^(DS|AVD)[-A-Za-z0-9]*\d", s):
-        return f"https://avd.aquasec.com/misconfig/{s.lower()}"
+    if re.match(r"^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$", s, re.IGNORECASE):
+        return f"https://github.com/advisories/{s}"
+    # Dockerfile misconfig (Trivy/AVD DS checks). IDs vary: DS002, DS-0031,
+    # AVD-DS-0002. The canonical page is the short code, e.g. ds031 / ds002.
+    m = re.match(r"^(?:AVD-)?DS-?0*(\d+)$", s, re.IGNORECASE)
+    if m:
+        return f"https://avd.aquasec.com/misconfig/ds{m.group(1).zfill(3)}"
     return None
 
 
@@ -536,6 +541,70 @@ def _finding_row(f: "Finding") -> str:
             f"{sanitize(f.title, 100)} | {finding_location_cell(f)} |")
 
 
+# Category grouping for the detail sections (IaC has vulnerabilities,
+# misconfigurations, and secrets; SCA and pipeline have a single category).
+CATEGORY_ORDER = ["Vulnerability", "Misconfiguration", "Secret", "Flaw",
+                  "Outdated Library"]
+CATEGORY_LABEL = {
+    "Vulnerability": "Vulnerabilities",
+    "Misconfiguration": "Misconfigurations",
+    "Secret": "Secrets",
+    "Flaw": "Flaws",
+    "Outdated Library": "Outdated Libraries",
+}
+
+
+def _group_by_category(findings: Sequence["Finding"]) -> List[Tuple[str, List["Finding"]]]:
+    groups: Dict[str, List["Finding"]] = {}
+    for f in findings:
+        groups.setdefault(f.category, []).append(f)
+    ordered = [(c, groups.pop(c)) for c in CATEGORY_ORDER if c in groups]
+    ordered += [(c, v) for c, v in groups.items()]
+    return ordered
+
+
+def _finding_row_grouped(f: "Finding") -> str:
+    sev = f"{BAND_DOT.get(f.band, '')} {f.band.capitalize()}"
+    if f.cvss is not None:
+        sev += f" ({f.cvss})"
+    return (f"| {sev} | {finding_id_cell(f)} | {sanitize(f.title, 100)} | "
+            f"{finding_location_cell(f)} |")
+
+
+def _grouped_tables(findings: Sequence["Finding"], budget: int) -> Tuple[List[str], int, int]:
+    """Detail tables grouped by finding category, within a character budget.
+
+    Returns (markdown_lines, shown_count, total_count).
+    """
+    total = len(findings)
+    lines: List[str] = []
+    used = 0
+    shown = 0
+    for cat, items in _group_by_category(findings):
+        label = CATEGORY_LABEL.get(cat, cat)
+        header = [f"**{label} ({len(items)})**", "",
+                  "| Severity | ID | Finding | Location |",
+                  "|:--|:--|:--|:--|"]
+        hlen = sum(len(line) + 1 for line in header)
+        if used + hlen > budget:
+            break
+        rows: List[str] = []
+        rused = hlen
+        for f in items:
+            row = _finding_row_grouped(f)
+            if used + rused + len(row) + 1 > budget:
+                break
+            rows.append(row)
+            rused += len(row) + 1
+            shown += 1
+        if rows:
+            lines += header + rows + [""]
+            used += rused + 1
+        if shown < total and used >= budget:
+            break
+    return lines, shown, total
+
+
 def _findings_table(findings: Sequence["Finding"]) -> List[str]:
     rows = ["| Severity | Type | ID | Finding | Location |",
             "|:--|:--|:--|:--|:--|"]
@@ -601,15 +670,10 @@ def build_report(findings: Sequence[Finding], threshold: Threshold,
     if gating:
         lines.append(f"### {len(gating)} finding(s) at or above threshold")
         lines.append("")
-        header = ["| Severity | Type | ID | Finding | Location |",
-                  "|:--|:--|:--|:--|:--|"]
-        all_rows = [_finding_row(f) for f in gating[:MAX_DETAIL_ROWS]]
-        # Keep the whole report comfortably under GitHub's text limit.
         budget = GH_TEXT_LIMIT - len("\n".join(lines)) - 2000
-        kept, shown = _rows_within_budget(all_rows, budget)
-        lines += header + kept
+        glines, shown, _tot = _grouped_tables(gating[:MAX_DETAIL_ROWS], budget)
+        lines += glines
         if shown < len(gating):
-            lines.append("")
             lines.append(f"_Showing the {shown} highest-severity of "
                          f"{len(gating)} findings. See the run or full report "
                          f"for the rest._")
@@ -681,20 +745,16 @@ def build_comment_section(sid: str, findings: Sequence[Finding],
         "<details>",
         "<summary><b>View findings at or above threshold</b></summary>",
         "",
-        "| Severity | Type | ID | Finding | Location |",
-        "|:--|:--|:--|:--|:--|",
     ]
     close_note_reserve = 240  # room for the "showing N of M" note + close tags
     fixed = (len("\n".join(head)) + 1 + len("\n".join(open_block)) + 1
              + len("</details>") + 1 + len(footer) + 1 + close_note_reserve)
     budget = GH_TEXT_LIMIT - len(_comment_marker(sid)) - 8 - fixed
 
-    all_rows = [_finding_row(f) for f in gating]
-    kept, shown = _rows_within_budget(all_rows, max(budget, 0))
+    group_lines, shown, _tot = _grouped_tables(gating, max(budget, 0))
 
-    lines = head + open_block + kept
+    lines = head + open_block + group_lines
     if shown < len(gating):
-        lines.append("")
         tail = "See the full report on the Veracode platform for the complete list." \
             if report_url else "See the run for the complete list."
         lines.append(f"_Showing the {shown} highest-severity of {len(gating)} "
