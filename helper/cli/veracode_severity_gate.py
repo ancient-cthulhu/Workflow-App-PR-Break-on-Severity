@@ -571,6 +571,40 @@ def _finding_row_grouped(f: "Finding") -> str:
             f"{finding_location_cell(f)} |")
 
 
+def _grouped_details(findings: Sequence["Finding"], budget: int) -> Tuple[List[str], int, int]:
+    """One collapsible <details> per finding category, within a char budget."""
+    total = len(findings)
+    lines: List[str] = []
+    used = 0
+    shown = 0
+    for cat, items in _group_by_category(findings):
+        label = CATEGORY_LABEL.get(cat, cat)
+        opener = ["<details>",
+                  f"<summary><b>{label} ({len(items)})</b></summary>",
+                  "",
+                  "| Severity | ID | Finding | Location |",
+                  "|:--|:--|:--|:--|"]
+        closer = ["", "</details>", ""]
+        frame = sum(len(line) + 1 for line in opener + closer)
+        if used + frame > budget:
+            break
+        rows: List[str] = []
+        rused = frame
+        for f in items:
+            row = _finding_row_grouped(f)
+            if used + rused + len(row) + 1 > budget:
+                break
+            rows.append(row)
+            rused += len(row) + 1
+            shown += 1
+        if rows:
+            lines += opener + rows + closer
+            used += rused
+        if shown < total and used >= budget:
+            break
+    return lines, shown, total
+
+
 def _grouped_tables(findings: Sequence["Finding"], budget: int) -> Tuple[List[str], int, int]:
     """Detail tables grouped by finding category, within a character budget.
 
@@ -741,26 +775,19 @@ def build_comment_section(sid: str, findings: Sequence[Finding],
 
     gating = sorted((f for f in findings if threshold.gates(f)),
                     key=lambda x: -x.effective_rank)
-    open_block = [
-        "<details>",
-        "<summary><b>View findings at or above threshold</b></summary>",
-        "",
-    ]
-    close_note_reserve = 240  # room for the "showing N of M" note + close tags
-    fixed = (len("\n".join(head)) + 1 + len("\n".join(open_block)) + 1
-             + len("</details>") + 1 + len(footer) + 1 + close_note_reserve)
+    close_note_reserve = 260  # room for the "showing N of M" note
+    fixed = len("\n".join(head)) + 1 + len(footer) + 1 + close_note_reserve
     budget = GH_TEXT_LIMIT - len(_comment_marker(sid)) - 8 - fixed
 
-    group_lines, shown, _tot = _grouped_tables(gating, max(budget, 0))
+    detail_lines, shown, _tot = _grouped_details(gating, max(budget, 0))
 
-    lines = head + open_block + group_lines
+    lines = head + detail_lines
     if shown < len(gating):
         tail = "See the full report on the Veracode platform for the complete list." \
             if report_url else "See the run for the complete list."
         lines.append(f"_Showing the {shown} highest-severity of {len(gating)} "
                      f"findings (GitHub comment size limit). {tail}_")
-    lines.append("</details>")
-    lines.append("")
+        lines.append("")
     lines.append(footer)
     return "\n".join(lines)
 
