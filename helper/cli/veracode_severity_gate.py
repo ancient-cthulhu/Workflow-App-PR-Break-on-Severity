@@ -503,17 +503,42 @@ SCAN_LABEL = {
 }
 
 
+def _finding_row(f: "Finding") -> str:
+    sev = f"{BAND_DOT.get(f.band, '')} {f.band.capitalize()}"
+    if f.cvss is not None:
+        sev += f" ({f.cvss})"
+    return (f"| {sev} | {sanitize(f.category, 20)} | {finding_id_cell(f)} | "
+            f"{sanitize(f.title, 100)} | {finding_location_cell(f)} |")
+
+
 def _findings_table(findings: Sequence["Finding"]) -> List[str]:
     rows = ["| Severity | Type | ID | Finding | Location |",
             "|:--|:--|:--|:--|:--|"]
-    for f in findings:
-        sev = f"{BAND_DOT.get(f.band, '')} {f.band.capitalize()}"
-        if f.cvss is not None:
-            sev += f" ({f.cvss})"
-        rows.append(
-            f"| {sev} | {sanitize(f.category, 20)} | {finding_id_cell(f)} | "
-            f"{sanitize(f.title, 100)} | {finding_location_cell(f)} |")
+    rows += [_finding_row(f) for f in findings]
     return rows
+
+
+def _rows_within_budget(rows: Sequence[str], budget: int) -> Tuple[List[str], int]:
+    """Return as many leading rows as fit in `budget` characters, and the count."""
+    kept: List[str] = []
+    used = 0
+    for r in rows:
+        if used + len(r) + 1 > budget:
+            break
+        kept.append(r)
+        used += len(r) + 1
+    return kept, len(kept)
+
+
+# GitHub hard limit for a comment body / check-run output is 65536 chars.
+GH_TEXT_LIMIT = 65536
+
+
+def extract_report_url(raw: str) -> Optional[str]:
+    """Pull the Veracode platform report URL out of a text report, if present."""
+    m = re.search(r"https://[^\s\"']*analysiscenter\.veracode\.com/[^\s\"']+",
+                  raw or "")
+    return m.group(0) if m else None
 
 
 def _counts_table(findings: Sequence["Finding"]) -> Tuple[List[str], Dict[str, int]]:
@@ -548,11 +573,18 @@ def build_report(findings: Sequence[Finding], threshold: Threshold,
     if gating:
         lines.append(f"### {len(gating)} finding(s) at or above threshold")
         lines.append("")
-        lines += _findings_table(gating[:MAX_DETAIL_ROWS])
-        if len(gating) > MAX_DETAIL_ROWS:
+        header = ["| Severity | Type | ID | Finding | Location |",
+                  "|:--|:--|:--|:--|:--|"]
+        all_rows = [_finding_row(f) for f in gating[:MAX_DETAIL_ROWS]]
+        # Keep the whole report comfortably under GitHub's text limit.
+        budget = GH_TEXT_LIMIT - len("\n".join(lines)) - 2000
+        kept, shown = _rows_within_budget(all_rows, budget)
+        lines += header + kept
+        if shown < len(gating):
             lines.append("")
-            lines.append(f"_Showing the {MAX_DETAIL_ROWS} highest-severity of "
-                         f"{len(gating)} gating findings. See the full scan report._")
+            lines.append(f"_Showing the {shown} highest-severity of "
+                         f"{len(gating)} findings. See the run or full report "
+                         f"for the rest._")
     else:
         lines.append("No findings at or above the threshold.")
     lines.append("")
@@ -586,42 +618,56 @@ def _comment_marker(sid: str) -> str:
 
 def build_comment_section(sid: str, findings: Sequence[Finding],
                           threshold: "Threshold", gated: int,
-                          run_url: Optional[str]) -> str:
+                          run_url: Optional[str],
+                          report_url: Optional[str] = None) -> str:
     label = SCAN_LABEL.get(sid, sid)
-    passed = gated == 0
-    badge = "\u2705 Passed" if passed else "\u274c Failed"
+    badge = "\u2705 Passed" if gated == 0 else "\u274c Failed"
     counts_rows, _ = _counts_table(findings)
 
-    lines = [
+    head = [
         f"## Veracode \u2014 {label}",
         "",
         f"> **{badge}** against threshold `{threshold.raw}`  ",
         f"> {len(findings)} finding(s) total \u00b7 **{gated}** at or above threshold",
         "",
-    ]
-    lines += counts_rows
-    lines.append("")
+    ] + counts_rows + [""]
 
-    if gated:
-        gating = sorted((f for f in findings if threshold.gates(f)),
-                        key=lambda x: -x.effective_rank)
-        shown = gating[:MAX_DETAIL_ROWS]
-        lines.append("<details>")
-        lines.append(f"<summary><b>View {gated} finding(s) at or above "
-                     f"threshold</b></summary>")
-        lines.append("")
-        lines += _findings_table(shown)
-        if len(gating) > len(shown):
-            lines.append("")
-            lines.append(f"_Showing the {len(shown)} highest-severity of {gated}. "
-                         f"See the run for the full list._")
-        lines.append("")
-        lines.append("</details>")
-
-    footer = "<sub>Automated by the Veracode severity gate"
+    links = []
+    if report_url:
+        links.append(f'<a href="{report_url}">Full report</a>')
     if run_url:
-        footer += f" \u00b7 <a href=\"{run_url}\">View run</a>"
-    footer += "</sub>"
+        links.append(f'<a href="{run_url}">View run</a>')
+    footer = ("<sub>Automated by the Veracode severity gate"
+              + (" \u00b7 " + " \u00b7 ".join(links) if links else "") + "</sub>")
+
+    if not gated:
+        return "\n".join(head + [footer])
+
+    gating = sorted((f for f in findings if threshold.gates(f)),
+                    key=lambda x: -x.effective_rank)
+    open_block = [
+        "<details>",
+        "<summary><b>View findings at or above threshold</b></summary>",
+        "",
+        "| Severity | Type | ID | Finding | Location |",
+        "|:--|:--|:--|:--|:--|",
+    ]
+    close_note_reserve = 240  # room for the "showing N of M" note + close tags
+    fixed = (len("\n".join(head)) + 1 + len("\n".join(open_block)) + 1
+             + len("</details>") + 1 + len(footer) + 1 + close_note_reserve)
+    budget = GH_TEXT_LIMIT - len(_comment_marker(sid)) - 8 - fixed
+
+    all_rows = [_finding_row(f) for f in gating]
+    kept, shown = _rows_within_budget(all_rows, max(budget, 0))
+
+    lines = head + open_block + kept
+    if shown < len(gating):
+        lines.append("")
+        tail = "See the full report for the complete list." if report_url \
+            else "See the run for the complete list."
+        lines.append(f"_Showing the {shown} highest-severity of {len(gating)} "
+                     f"findings (GitHub comment size limit). {tail}_")
+    lines.append("</details>")
     lines.append("")
     lines.append(footer)
     return "\n".join(lines)
@@ -806,7 +852,7 @@ def run(args: argparse.Namespace) -> int:
     if args.pr_comment:
         section = build_comment_section(
             args.pr_comment, findings, threshold, gated,
-            os.environ.get("RUN_URL"))
+            os.environ.get("RUN_URL"), extract_report_url(raw))
         upsert_pr_comment(args.pr_comment, section)
 
     if gated and not args.warn_only:
