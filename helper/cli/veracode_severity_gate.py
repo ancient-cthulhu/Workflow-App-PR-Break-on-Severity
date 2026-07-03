@@ -210,11 +210,13 @@ def _fetch_tree_paths(api: str, repo: str, ref: str, token: str) -> Dict[str, st
 
 
 def correct_file_cases(findings: Sequence["Finding"]) -> None:
-    """Fix finding file paths to the repo's real case so blob links resolve.
+    """Map finding file paths to the repo's real path so blob links resolve.
 
-    Some scanners (SAST on .NET) report lowercased paths, but GitHub blob URLs
-    are case-sensitive. This looks up the actual tree once and rewrites paths.
-    Best-effort: on any failure the original paths are kept.
+    Handles two scanner behaviours: case differences (SAST on .NET lowercases
+    paths) and stripped prefixes (SAST on Java reports paths relative to the
+    source/package root, e.g. dropping app/src/main/java/). Resolves each path
+    against the actual repo tree, first by exact case-insensitive match, then by
+    a unique suffix match. Best-effort: unmatched or ambiguous paths are kept.
     """
     if not any(f.file for f in findings):
         return
@@ -224,14 +226,28 @@ def correct_file_cases(findings: Sequence["Finding"]) -> None:
     if not (token and repo and ref):
         return
     api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
-    tree = _fetch_tree_paths(api, repo, ref, token)
+    tree = _fetch_tree_paths(api, repo, ref, token)  # {lower_path: real_path}
     if not tree:
         return
+
+    # Index real paths by basename for efficient suffix matching.
+    by_base: Dict[str, List[Tuple[str, str]]] = {}
+    for lower, real in tree.items():
+        by_base.setdefault(lower.rsplit("/", 1)[-1], []).append((lower, real))
+
     for f in findings:
-        if f.file:
-            real = tree.get(f.file.lower())
-            if real:
-                f.file = real
+        if not f.file:
+            continue
+        fl = f.file.replace("\\", "/").lstrip("/").lower()
+        real = tree.get(fl)
+        if real:
+            f.file = real
+            continue
+        # Prefix-stripped path: find the unique repo path ending with it.
+        candidates = [r for (lower, r) in by_base.get(fl.rsplit("/", 1)[-1], [])
+                      if lower == fl or lower.endswith("/" + fl)]
+        if len(candidates) == 1:
+            f.file = candidates[0]
 
 
 class Finding:
