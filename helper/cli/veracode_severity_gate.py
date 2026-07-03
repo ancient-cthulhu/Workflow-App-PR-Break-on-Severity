@@ -650,7 +650,7 @@ def build_comment_section(sid: str, findings: Sequence[Finding],
 
     links = []
     if report_url:
-        links.append(f'<a href="{report_url}">Full report</a>')
+        links.append(f'<a href="{report_url}">Full report on Veracode platform</a>')
     if run_url:
         links.append(f'<a href="{run_url}">View run</a>')
     footer = ("<sub>Automated by the Veracode severity gate"
@@ -679,8 +679,8 @@ def build_comment_section(sid: str, findings: Sequence[Finding],
     lines = head + open_block + kept
     if shown < len(gating):
         lines.append("")
-        tail = "See the full report for the complete list." if report_url \
-            else "See the run for the complete list."
+        tail = "See the full report on the Veracode platform for the complete list." \
+            if report_url else "See the run for the complete list."
         lines.append(f"_Showing the {shown} highest-severity of {len(gating)} "
                      f"findings (GitHub comment size limit). {tail}_")
     lines.append("</details>")
@@ -863,10 +863,9 @@ def run(args: argparse.Namespace) -> int:
         if reported is not None:
             parsed = sum(1 for f in findings if f.category == "Vulnerability")
             if parsed < reported:
-                note = (f"Parsed {parsed} of {reported} vulnerabilities from the "
-                        f"agent report. The report's issue list omits some entries "
-                        f"(typically low severity); gating on the {parsed} shown. "
-                        f"For the full set, enable issues (JSON) or see the report.")
+                note = ("This summary shows as many findings as fit within "
+                        "GitHub's character limit. See the full report on the "
+                        "Veracode platform for the complete list.")
 
     report, gated = build_report(findings, threshold, args.mode, note)
     emit(report)
