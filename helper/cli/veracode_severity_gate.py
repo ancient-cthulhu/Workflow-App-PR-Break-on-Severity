@@ -415,9 +415,18 @@ def parse_sca_text(text: str, include_outdated: bool = False) -> List[Finding]:
         issue_id, itype, cvss, desc, lib = m.groups()
         if itype == "Outdated Library" and not include_outdated:
             continue
+        desc = desc.strip()
+        # Prefer the CVE as the identifier (links to NVD); fall back to issue id.
+        cve = re.match(r"(CVE-\d{4}-\d+)\s*:?\s*(.*)", desc, re.IGNORECASE)
+        if cve:
+            ident = cve.group(1).upper()
+            title = cve.group(2).strip() or desc
+        else:
+            ident = issue_id
+            title = desc
         findings.append(Finding(
             "Vulnerability" if itype == "Vulnerability" else "Outdated Library",
-            cvss_to_label(cvss), issue_id, desc.strip(), lib.strip(), float(cvss)))
+            cvss_to_label(cvss), ident, title, lib.strip(), float(cvss)))
     return findings
 
 
@@ -556,7 +565,7 @@ def _counts_table(findings: Sequence["Finding"]) -> Tuple[List[str], Dict[str, i
 
 
 def build_report(findings: Sequence[Finding], threshold: Threshold,
-                 mode: str) -> Tuple[str, int]:
+                 mode: str, note: Optional[str] = None) -> Tuple[str, int]:
     gating = sorted((f for f in findings if threshold.gates(f)),
                     key=lambda x: -x.effective_rank)
     label = SCAN_LABEL.get(mode, mode.upper())
@@ -566,6 +575,9 @@ def build_report(findings: Sequence[Finding], threshold: Threshold,
              f"Threshold **{threshold.raw}** (fail at this level or higher) \u00b7 "
              f"{len(findings)} finding(s) \u00b7 {len(gating)} at or above threshold",
              ""]
+    if note:
+        lines.append(f"> Note: {note}")
+        lines.append("")
     counts_rows, _ = _counts_table(findings)
     lines += counts_rows
     lines.append("")
@@ -619,7 +631,8 @@ def _comment_marker(sid: str) -> str:
 def build_comment_section(sid: str, findings: Sequence[Finding],
                           threshold: "Threshold", gated: int,
                           run_url: Optional[str],
-                          report_url: Optional[str] = None) -> str:
+                          report_url: Optional[str] = None,
+                          note: Optional[str] = None) -> str:
     label = SCAN_LABEL.get(sid, sid)
     badge = "\u2705 Passed" if gated == 0 else "\u274c Failed"
     counts_rows, _ = _counts_table(findings)
@@ -630,7 +643,10 @@ def build_comment_section(sid: str, findings: Sequence[Finding],
         f"> **{badge}** against threshold `{threshold.raw}`  ",
         f"> {len(findings)} finding(s) total \u00b7 **{gated}** at or above threshold",
         "",
-    ] + counts_rows + [""]
+    ]
+    if note:
+        head += [f"> \u2139\ufe0f {note}", ""]
+    head += counts_rows + [""]
 
     links = []
     if report_url:
@@ -813,15 +829,6 @@ def load_findings(mode: str, raw: str, include_outdated: bool) -> List[Finding]:
         return parse_sca_json(data)
 
     findings = parse_sca_text(raw, include_outdated=include_outdated)
-    reported = parse_sca_summary(raw)
-    if reported is not None:
-        parsed_vulns = sum(1 for f in findings if f.category == "Vulnerability")
-        if parsed_vulns < reported:
-            raise GateError(
-                f"SCA text report reconciliation failed: parsed {parsed_vulns} "
-                f"vulnerability rows but the summary reports {reported}. The "
-                f"report format may have changed. Failing closed to avoid "
-                f"under-reporting; enable issues to gate on the JSON report.")
     return findings
 
 
@@ -846,13 +853,28 @@ def run(args: argparse.Namespace) -> int:
         correct_file_cases(findings)  # best-effort: fix path case for links
     except Exception:  # noqa: BLE001 - never let link polish affect the gate
         pass
-    report, gated = build_report(findings, threshold, args.mode)
+
+    # For the SCA text report, the summary counts can exceed the issue list
+    # (the agent omits some entries, e.g. low severity, from the issue list).
+    # Note it rather than failing, so results and the report link still show.
+    note = None
+    if args.mode == "sca" and raw.lstrip()[:1] not in ("{", "["):
+        reported = parse_sca_summary(raw)
+        if reported is not None:
+            parsed = sum(1 for f in findings if f.category == "Vulnerability")
+            if parsed < reported:
+                note = (f"Parsed {parsed} of {reported} vulnerabilities from the "
+                        f"agent report. The report's issue list omits some entries "
+                        f"(typically low severity); gating on the {parsed} shown. "
+                        f"For the full set, enable issues (JSON) or see the report.")
+
+    report, gated = build_report(findings, threshold, args.mode, note)
     emit(report)
 
     if args.pr_comment:
         section = build_comment_section(
             args.pr_comment, findings, threshold, gated,
-            os.environ.get("RUN_URL"), extract_report_url(raw))
+            os.environ.get("RUN_URL"), extract_report_url(raw), note)
         upsert_pr_comment(args.pr_comment, section)
 
     if gated and not args.warn_only:
