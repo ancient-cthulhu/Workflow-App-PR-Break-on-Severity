@@ -257,7 +257,7 @@ def correct_file_cases(findings: Sequence["Finding"]) -> None:
 
 class Finding:
     __slots__ = ("category", "severity", "ident", "title", "location", "cvss",
-                 "floor", "file", "line")
+                 "floor", "file", "line", "fix", "cve")
 
     def __init__(
         self,
@@ -270,6 +270,8 @@ class Finding:
         floor: int = FLOOR_DEFAULT,
         file: Optional[str] = None,
         line: Optional[int] = None,
+        fix: Optional[str] = None,
+        cve: Optional[str] = None,
     ) -> None:
         self.category = category
         self.severity = severity  # raw; may be None or an unknown string
@@ -278,8 +280,10 @@ class Finding:
         self.location = location or ""
         self.cvss = cvss
         self.floor = floor
-        self.file = file or ""      # repo-relative source path, when known
+        self.file = file or ""      # repo-relative source/manifest path, when known
         self.line = line            # 1-based line number, when known
+        self.fix = fix or ""        # fixed version(s) or fix state (dependencies)
+        self.cve = cve or ""        # related CVE for an advisory (e.g. GHSA)
 
     @property
     def effective_rank(self) -> int:
@@ -324,10 +328,38 @@ def parse_iac(data: Any) -> List[Finding]:
         v = m.get("vulnerability") or {}
         art = m.get("artifact") or {}
         score = _cvss_from_match(v)
-        loc = f"{art.get('name', '')} {art.get('version', '')}".strip()
+        pkg = f"{art.get('name', '')} {art.get('version', '')}".strip()
+
+        # Fixed version(s) or fix state (e.g. "not fixed").
+        fixobj = v.get("fix") or {}
+        versions = fixobj.get("versions") or []
+        if versions:
+            fix = ", ".join(str(x) for x in versions)
+        else:
+            state = (fixobj.get("state") or "").lower()
+            fix = {"not-fixed": "not fixed", "wont-fix": "won't fix",
+                   "unknown": "", "": ""}.get(state, state.replace("-", " "))
+
+        # Related CVE behind an advisory id (GHSA), when present.
+        cve = ""
+        for rv in (m.get("relatedVulnerabilities") or []):
+            rid = str(rv.get("id") or "")
+            if rid.upper().startswith("CVE-"):
+                cve = rid.upper()
+                break
+
+        # Manifest/source file where the package was found.
+        manifest = ""
+        for locn in (art.get("locations") or []):
+            p = locn.get("path") or locn.get("RealPath") or ""
+            if p:
+                manifest = clean_path(p)
+                break
+
         findings.append(Finding(
             "Vulnerability", v.get("severity"), v.get("id"),
-            v.get("description") or v.get("id"), loc, score, FLOOR_DEFAULT))
+            v.get("description") or v.get("id"), pkg, score, FLOOR_DEFAULT,
+            file=manifest, fix=fix, cve=cve))
 
     for s in data.get("secrets") or []:
         line = s.get("StartLine") or s.get("startLine")
@@ -563,6 +595,48 @@ def _group_by_category(findings: Sequence["Finding"]) -> List[Tuple[str, List["F
     return ordered
 
 
+def _sev_cell(f: "Finding") -> str:
+    s = f"{BAND_DOT.get(f.band, '')} {f.band.capitalize()}"
+    if f.cvss is not None:
+        s += f" ({f.cvss})"
+    return s
+
+
+def _vuln_id_cell(f: "Finding") -> str:
+    cell = finding_id_cell(f)
+    if f.cve and f.cve.upper() not in (f.ident or "").upper():
+        cell += f" / {_md_link(f.cve, id_url(f.cve), 20)}"
+    return cell
+
+
+def _pkg_cell(f: "Finding") -> str:
+    # Package coordinate, linked to the manifest file when it resolves.
+    if f.file:
+        return _md_link(f.location, github_blob_url(f.file, f.line), 50)
+    return sanitize(f.location, 50)
+
+
+def _group_render(cat: str, items: Sequence["Finding"]) -> Tuple[List[str], List[str]]:
+    """Header lines and row lines tailored to a finding category."""
+    if cat == "Vulnerability":
+        if any(f.fix for f in items):
+            header = ["| Severity | ID | Package | Fixed in | Vulnerability |",
+                      "|:--|:--|:--|:--|:--|"]
+            rows = [f"| {_sev_cell(f)} | {_vuln_id_cell(f)} | {_pkg_cell(f)} | "
+                    f"{sanitize(f.fix or '\u2014', 30)} | {sanitize(f.title, 90)} |"
+                    for f in items]
+        else:
+            header = ["| Severity | ID | Package | Vulnerability |",
+                      "|:--|:--|:--|:--|"]
+            rows = [f"| {_sev_cell(f)} | {_vuln_id_cell(f)} | {_pkg_cell(f)} | "
+                    f"{sanitize(f.title, 90)} |" for f in items]
+        return header, rows
+    header = ["| Severity | ID | Finding | Location |", "|:--|:--|:--|:--|"]
+    rows = [f"| {_sev_cell(f)} | {finding_id_cell(f)} | {sanitize(f.title, 100)} | "
+            f"{finding_location_cell(f)} |" for f in items]
+    return header, rows
+
+
 def _finding_row_grouped(f: "Finding") -> str:
     sev = f"{BAND_DOT.get(f.band, '')} {f.band.capitalize()}"
     if f.cvss is not None:
@@ -579,19 +653,17 @@ def _grouped_details(findings: Sequence["Finding"], budget: int) -> Tuple[List[s
     shown = 0
     for cat, items in _group_by_category(findings):
         label = CATEGORY_LABEL.get(cat, cat)
+        header, rows_all = _group_render(cat, items)
         opener = ["<details>",
                   f"<summary><b>{label} ({len(items)})</b></summary>",
-                  "",
-                  "| Severity | ID | Finding | Location |",
-                  "|:--|:--|:--|:--|"]
+                  ""] + header
         closer = ["", "</details>", ""]
         frame = sum(len(line) + 1 for line in opener + closer)
         if used + frame > budget:
             break
         rows: List[str] = []
         rused = frame
-        for f in items:
-            row = _finding_row_grouped(f)
+        for row in rows_all:
             if used + rused + len(row) + 1 > budget:
                 break
             rows.append(row)
@@ -616,16 +688,14 @@ def _grouped_tables(findings: Sequence["Finding"], budget: int) -> Tuple[List[st
     shown = 0
     for cat, items in _group_by_category(findings):
         label = CATEGORY_LABEL.get(cat, cat)
-        header = [f"**{label} ({len(items)})**", "",
-                  "| Severity | ID | Finding | Location |",
-                  "|:--|:--|:--|:--|"]
+        table_header, rows_all = _group_render(cat, items)
+        header = [f"**{label} ({len(items)})**", ""] + table_header
         hlen = sum(len(line) + 1 for line in header)
         if used + hlen > budget:
             break
         rows: List[str] = []
         rused = hlen
-        for f in items:
-            row = _finding_row_grouped(f)
+        for row in rows_all:
             if used + rused + len(row) + 1 > budget:
                 break
             rows.append(row)
