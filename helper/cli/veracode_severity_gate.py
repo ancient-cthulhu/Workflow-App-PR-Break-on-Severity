@@ -185,10 +185,15 @@ def _md_link(text: str, url: Optional[str], limit: int) -> str:
 
 
 def finding_location_cell(f: "Finding") -> str:
-    """A readable, linked location for one finding."""
+    """A compact, linked location for one finding.
+
+    The display text is shortened to the file name (plus line) so a long source
+    path does not dominate the table; the link still targets the full path.
+    """
     if f.file:
-        disp = f.file + (f":{f.line}" if f.line else "")
-        return _md_link(disp, github_blob_url(f.file, f.line), 80)
+        base = f.file.rsplit("/", 1)[-1]
+        disp = base + (f":{f.line}" if f.line else "")
+        return _md_link(disp, github_blob_url(f.file, f.line), 60)
     if f.location:
         return sanitize(f.location, 80)
     return "\u2014"  # em dash placeholder for unknown
@@ -196,6 +201,20 @@ def finding_location_cell(f: "Finding") -> str:
 
 def finding_id_cell(f: "Finding") -> str:
     return _md_link(f.ident, id_url(f.ident), 40) if f.ident else "\u2014"
+
+
+_VERSION_RE = re.compile(r"^v?\d[\w.\-+]*$")
+
+
+def _split_name_version(s: str) -> Tuple[str, str]:
+    """Split 'library 1.2.3' into ('library', '1.2.3'). Version must look like
+    a version; otherwise the whole string is the name."""
+    s = (s or "").strip()
+    if " " in s:
+        name, _, ver = s.rpartition(" ")
+        if _VERSION_RE.match(ver):
+            return name.strip(), ver.strip()
+    return s, ""
 
 
 def _fetch_tree_paths(api: str, repo: str, ref: str, token: str) -> Dict[str, str]:
@@ -257,7 +276,7 @@ def correct_file_cases(findings: Sequence["Finding"]) -> None:
 
 class Finding:
     __slots__ = ("category", "severity", "ident", "title", "location", "cvss",
-                 "floor", "file", "line", "fix", "cve")
+                 "floor", "file", "line", "fix", "cve", "version")
 
     def __init__(
         self,
@@ -272,6 +291,7 @@ class Finding:
         line: Optional[int] = None,
         fix: Optional[str] = None,
         cve: Optional[str] = None,
+        version: Optional[str] = None,
     ) -> None:
         self.category = category
         self.severity = severity  # raw; may be None or an unknown string
@@ -284,6 +304,7 @@ class Finding:
         self.line = line            # 1-based line number, when known
         self.fix = fix or ""        # fixed version(s) or fix state (dependencies)
         self.cve = cve or ""        # related CVE for an advisory (e.g. GHSA)
+        self.version = version or ""  # installed library version, when known
 
     @property
     def effective_rank(self) -> int:
@@ -328,7 +349,6 @@ def parse_iac(data: Any) -> List[Finding]:
         v = m.get("vulnerability") or {}
         art = m.get("artifact") or {}
         score = _cvss_from_match(v)
-        pkg = f"{art.get('name', '')} {art.get('version', '')}".strip()
 
         # Fixed version(s) or fix state (e.g. "not fixed").
         fixobj = v.get("fix") or {}
@@ -358,8 +378,9 @@ def parse_iac(data: Any) -> List[Finding]:
 
         findings.append(Finding(
             "Vulnerability", v.get("severity"), v.get("id"),
-            v.get("description") or v.get("id"), pkg, score, FLOOR_DEFAULT,
-            file=manifest, fix=fix, cve=cve))
+            v.get("description") or v.get("id"),
+            art.get("name", ""), score, FLOOR_DEFAULT,
+            file=manifest, fix=fix, cve=cve, version=art.get("version", "")))
 
     for s in data.get("secrets") or []:
         line = s.get("StartLine") or s.get("startLine")
@@ -451,6 +472,100 @@ def parse_sca_summary(text: str) -> Optional[int]:
     return total if seen else None
 
 
+def parse_sca_update_advisor(text: str) -> List[Dict[str, str]]:
+    """Parse the agent's 'Update Advisor' section (present only when the scan
+    ran with --update-advisor). Header-driven so it adapts to the columns the
+    agent emits (Library, Version In Use, Safe/Update-to Version, Breaking
+    Update). Returns [] if the section is absent or cannot be parsed.
+    """
+    lines = text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if re.match(r"\s*update advisor\b", line, re.IGNORECASE):
+            start = i
+            break
+    if start is None:
+        return []
+
+    header = None
+    hidx = None
+    for j in range(start + 1, min(start + 10, len(lines))):
+        s = lines[j].strip()
+        if not s or set(s) <= set("=-_ "):
+            continue
+        cols = re.split(r"\s{2,}", s)
+        if len(cols) >= 2 and re.search(r"(?i)breaking|version|update|librar", s):
+            header = [c.strip().lower() for c in cols]
+            hidx = j
+            break
+    if not header:
+        return []
+
+    def col_index(*names: str) -> Optional[int]:
+        for k, h in enumerate(header):
+            if any(n in h for n in names):
+                return k
+        return None
+
+    i_lib = col_index("librar")
+    i_lib = 0 if i_lib is None else i_lib
+    i_use = col_index("in use", "current", "installed")
+    i_to = col_index("safe", "update to", "recommend", "update", "fixed")
+    i_brk = col_index("breaking")
+    i_fixes = col_index("vulnerabilit", "fixes", "issues")
+
+    def cell(cols: List[str], idx: Optional[int]) -> str:
+        return cols[idx].strip() if (idx is not None and idx < len(cols)) else ""
+
+    rows: List[Dict[str, str]] = []
+    for line in lines[hidx + 1:]:
+        s = line.strip()
+        if not s:
+            if rows:
+                break
+            continue
+        if set(s) <= set("=-_ "):
+            continue
+        if re.match(r"(?i)(full report details|update advisor)", s):
+            break
+        cols = [c.strip() for c in re.split(r"\s{2,}", s)]
+        if len(cols) < 2:
+            break
+        rows.append({
+            "library": cell(cols, i_lib),
+            "in_use": cell(cols, i_use),
+            "update_to": cell(cols, i_to),
+            "breaking": cell(cols, i_brk),
+            "fixes": cell(cols, i_fixes),
+        })
+    # If there is no separate in-use column, the current version is usually
+    # embedded in the library field (e.g. "commons-collections4 4.0").
+    for r in rows:
+        if not r["in_use"] and r["library"]:
+            name, ver = _split_name_version(r["library"])
+            if ver:
+                r["library"], r["in_use"] = name, ver
+    return rows
+
+
+def backfill_advisor_in_use(advisories: List[Dict[str, str]],
+                            findings: Sequence["Finding"]) -> None:
+    """Fill an empty advisor 'in use' version from the parsed issues list."""
+    if not advisories:
+        return
+    ver_by_lib: Dict[str, str] = {}
+    for f in findings:
+        if f.location and f.version:
+            ver_by_lib.setdefault(f.location.strip().lower(), f.version)
+    for a in advisories:
+        if a.get("in_use"):
+            continue
+        lib_raw = re.sub(r"\s*\([^)]*\)\s*$", "", a.get("library", "")).strip()
+        name, ver = _split_name_version(lib_raw)
+        a["in_use"] = ver or ver_by_lib.get(name.lower(),
+                                            ver_by_lib.get(lib_raw.lower(), ""))
+
+
 def parse_sca_text(text: str, include_outdated: bool = False) -> List[Finding]:
     findings: List[Finding] = []
     in_issues = False
@@ -477,9 +592,10 @@ def parse_sca_text(text: str, include_outdated: bool = False) -> List[Finding]:
         else:
             ident = issue_id
             title = desc
+        name, ver = _split_name_version(lib.strip())
         findings.append(Finding(
             "Vulnerability" if itype == "Vulnerability" else "Outdated Library",
-            cvss_to_label(cvss), ident, title, lib.strip(), float(cvss)))
+            cvss_to_label(cvss), ident, title, name, float(cvss), version=ver))
     return findings
 
 
@@ -616,21 +732,30 @@ def _pkg_cell(f: "Finding") -> str:
     return sanitize(f.location, 50)
 
 
-def _group_render(cat: str, items: Sequence["Finding"]) -> Tuple[List[str], List[str]]:
+def _group_render(cat: str, items: Sequence["Finding"],
+                  show_fix: bool = True) -> Tuple[List[str], List[str]]:
     """Header lines and row lines tailored to a finding category."""
     if cat == "Vulnerability":
-        if any(f.fix for f in items):
-            header = ["| Severity | ID | Package | Fixed in | Vulnerability |",
-                      "|:--|:--|:--|:--|:--|"]
-            rows = [f"| {_sev_cell(f)} | {_vuln_id_cell(f)} | {_pkg_cell(f)} | "
-                    f"{sanitize(f.fix or '\u2014', 30)} | {sanitize(f.title, 90)} |"
-                    for f in items]
-        else:
-            header = ["| Severity | ID | Package | Vulnerability |",
-                      "|:--|:--|:--|:--|"]
-            rows = [f"| {_sev_cell(f)} | {_vuln_id_cell(f)} | {_pkg_cell(f)} | "
-                    f"{sanitize(f.title, 90)} |" for f in items]
-        return header, rows
+        has_ver = any(f.version for f in items)
+        has_fix = show_fix and any(f.fix for f in items)
+        cols = ["Severity", "ID", "Library"]
+        if has_ver:
+            cols.append("Version")
+        if has_fix:
+            cols.append("Fixed in")
+        cols.append("Vulnerability")
+        header = ["| " + " | ".join(cols) + " |", "|" + ":--|" * len(cols)]
+
+        def row(f: "Finding") -> str:
+            cells = [_sev_cell(f), _vuln_id_cell(f), _pkg_cell(f)]
+            if has_ver:
+                cells.append(sanitize(f.version, 20) or "\u2014")
+            if has_fix:
+                cells.append(sanitize(f.fix or "\u2014", 30))
+            cells.append(sanitize(f.title, 90))
+            return "| " + " | ".join(cells) + " |"
+
+        return header, [row(f) for f in items]
     header = ["| Severity | ID | Finding | Location |", "|:--|:--|:--|:--|"]
     rows = [f"| {_sev_cell(f)} | {finding_id_cell(f)} | {sanitize(f.title, 100)} | "
             f"{finding_location_cell(f)} |" for f in items]
@@ -645,7 +770,7 @@ def _finding_row_grouped(f: "Finding") -> str:
             f"{finding_location_cell(f)} |")
 
 
-def _grouped_details(findings: Sequence["Finding"], budget: int) -> Tuple[List[str], int, int]:
+def _grouped_details(findings: Sequence["Finding"], budget: int, show_fix: bool = True) -> Tuple[List[str], int, int]:
     """One collapsible <details> per finding category, within a char budget."""
     total = len(findings)
     lines: List[str] = []
@@ -653,7 +778,7 @@ def _grouped_details(findings: Sequence["Finding"], budget: int) -> Tuple[List[s
     shown = 0
     for cat, items in _group_by_category(findings):
         label = CATEGORY_LABEL.get(cat, cat)
-        header, rows_all = _group_render(cat, items)
+        header, rows_all = _group_render(cat, items, show_fix)
         opener = ["<details>",
                   f"<summary><b>{label} ({len(items)})</b></summary>",
                   ""] + header
@@ -677,7 +802,7 @@ def _grouped_details(findings: Sequence["Finding"], budget: int) -> Tuple[List[s
     return lines, shown, total
 
 
-def _grouped_tables(findings: Sequence["Finding"], budget: int) -> Tuple[List[str], int, int]:
+def _grouped_tables(findings: Sequence["Finding"], budget: int, show_fix: bool = True) -> Tuple[List[str], int, int]:
     """Detail tables grouped by finding category, within a character budget.
 
     Returns (markdown_lines, shown_count, total_count).
@@ -688,7 +813,7 @@ def _grouped_tables(findings: Sequence["Finding"], budget: int) -> Tuple[List[st
     shown = 0
     for cat, items in _group_by_category(findings):
         label = CATEGORY_LABEL.get(cat, cat)
-        table_header, rows_all = _group_render(cat, items)
+        table_header, rows_all = _group_render(cat, items, show_fix)
         header = [f"**{label} ({len(items)})**", ""] + table_header
         hlen = sum(len(line) + 1 for line in header)
         if used + hlen > budget:
@@ -775,7 +900,7 @@ def build_report(findings: Sequence[Finding], threshold: Threshold,
         lines.append(f"### {len(gating)} finding(s) at or above threshold")
         lines.append("")
         budget = GH_TEXT_LIMIT - len("\n".join(lines)) - 2000
-        glines, shown, _tot = _grouped_tables(gating[:MAX_DETAIL_ROWS], budget)
+        glines, shown, _tot = _grouped_tables(gating[:MAX_DETAIL_ROWS], budget, mode != "iac")
         lines += glines
         if shown < len(gating):
             lines.append(f"_Showing the {shown} highest-severity of "
@@ -816,7 +941,8 @@ def build_comment_section(sid: str, findings: Sequence[Finding],
                           threshold: "Threshold", gated: int,
                           run_url: Optional[str],
                           report_url: Optional[str] = None,
-                          note: Optional[str] = None) -> str:
+                          note: Optional[str] = None,
+                          advisories: Optional[Sequence[Dict[str, str]]] = None) -> str:
     label = SCAN_LABEL.get(sid, sid)
     badge = "\u2705 Passed" if gated == 0 else "\u274c Failed"
     counts_rows, _ = _counts_table(findings)
@@ -849,7 +975,7 @@ def build_comment_section(sid: str, findings: Sequence[Finding],
     fixed = len("\n".join(head)) + 1 + len(footer) + 1 + close_note_reserve
     budget = GH_TEXT_LIMIT - len(_comment_marker(sid)) - 8 - fixed
 
-    detail_lines, shown, _tot = _grouped_details(gating, max(budget, 0))
+    detail_lines, shown, _tot = _grouped_details(gating, max(budget, 0), sid != "iac")
 
     lines = head + detail_lines
     if shown < len(gating):
@@ -858,8 +984,32 @@ def build_comment_section(sid: str, findings: Sequence[Finding],
         lines.append(f"_Showing the {shown} highest-severity of {len(gating)} "
                      f"findings (GitHub comment size limit). {tail}_")
         lines.append("")
+    lines += _advisor_details(advisories)
     lines.append(footer)
     return "\n".join(lines)
+
+
+def _advisor_details(advisories: Optional[Sequence[Dict[str, str]]]) -> List[str]:
+    """Collapsible 'Update Advisor' table of recommended safe versions.
+    Only columns that have data in at least one row are shown."""
+    if not advisories:
+        return []
+    spec = [("library", "Library"), ("in_use", "In use"),
+            ("update_to", "Update to"), ("fixes", "Fixes"),
+            ("breaking", "Breaking update")]
+    keys = [(k, label) for k, label in spec
+            if k == "library" or any(a.get(k) for a in advisories)]
+    header = "| " + " | ".join(label for _, label in keys) + " |"
+    sep = "|" + ":--|" * len(keys)
+    lines = ["<details>",
+             f"<summary><b>Update Advisor ({len(advisories)})</b></summary>",
+             "", "Recommended safe versions to resolve vulnerabilities.", "",
+             header, sep]
+    for a in advisories:
+        lines.append("| " + " | ".join(
+            sanitize(a.get(k, ""), 50) for k, _ in keys) + " |")
+    lines += ["", "</details>", ""]
+    return lines
 
 
 def _comment_body(sid: str, section_md: str) -> str:
@@ -1031,7 +1181,10 @@ def run(args: argparse.Namespace) -> int:
     # (the agent omits some entries, e.g. low severity, from the issue list).
     # Note it rather than failing, so results and the report link still show.
     note = None
+    advisories: List[Dict[str, str]] = []
     if args.mode == "sca" and raw.lstrip()[:1] not in ("{", "["):
+        advisories = parse_sca_update_advisor(raw)
+        backfill_advisor_in_use(advisories, findings)
         reported = parse_sca_summary(raw)
         if reported is not None:
             parsed = sum(1 for f in findings if f.category == "Vulnerability")
@@ -1046,7 +1199,7 @@ def run(args: argparse.Namespace) -> int:
     if args.pr_comment:
         section = build_comment_section(
             args.pr_comment, findings, threshold, gated,
-            os.environ.get("RUN_URL"), extract_report_url(raw), note)
+            os.environ.get("RUN_URL"), extract_report_url(raw), note, advisories)
         upsert_pr_comment(args.pr_comment, section)
 
     if gated and not args.warn_only:
