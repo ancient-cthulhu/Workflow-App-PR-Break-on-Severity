@@ -164,6 +164,11 @@ jobs:
           create-issues: false
           recursive: true
           allow-dirty: true
+          # Show the Update Advisor (safe upgrade versions) in the scan output so
+          # the severity gate can render it. Requires an action version that
+          # supports this input (present on main; bump the pin above if v2.1.19
+          # warns "Unexpected input 'update_advisor'").
+          update_advisor: true
           # The agent-based scan gates on the SCA workspace policy. Leave this
           # as configured; the severity gate below is the enforcing control.
           breakBuildOnPolicyFindings: ${{ github.event.client_payload.user_config.break_build_policy_findings }}
@@ -193,6 +198,9 @@ jobs:
           GH_TOKEN: ${{ github.event.client_payload.token }}
           SCAN_REPO: ${{ github.event.client_payload.repository.full_name }}
           HEAD_SHA: ${{ github.event.client_payload.sha }}
+          # Link file locations to the branch (matches the pipeline gate)
+          # so they resolve consistently regardless of the dispatch SHA.
+          BLOB_REF: ${{ github.event.client_payload.repository.branch }}
           PR_NUMBER: ${{ github.event.client_payload.pr_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
