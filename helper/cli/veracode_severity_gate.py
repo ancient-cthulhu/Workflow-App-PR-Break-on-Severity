@@ -169,11 +169,9 @@ def id_url(ident: Optional[str]) -> Optional[str]:
         return f"https://nvd.nist.gov/vuln/detail/{s.upper()}"
     if re.match(r"^GHSA-[0-9a-z]{4}-[0-9a-z]{4}-[0-9a-z]{4}$", s, re.IGNORECASE):
         return f"https://github.com/advisories/{s}"
-    # Dockerfile misconfig (Trivy/AVD DS checks). IDs vary: DS002, DS-0031,
-    # AVD-DS-0002. The canonical page is the short code, e.g. ds031 / ds002.
-    m = re.match(r"^(?:AVD-)?DS-?0*(\d+)$", s, re.IGNORECASE)
-    if m:
-        return f"https://avd.aquasec.com/misconfig/ds{m.group(1).zfill(3)}"
+    # Misconfiguration rule IDs (e.g. DS002) are Aqua/Trivy identifiers; we do
+    # not link them to a third-party database here. The IaC parser instead
+    # attaches a neutral reference URL from the finding itself (see ref_url).
     return None
 
 
@@ -200,7 +198,9 @@ def finding_location_cell(f: "Finding") -> str:
 
 
 def finding_id_cell(f: "Finding") -> str:
-    return _md_link(f.ident, id_url(f.ident), 40) if f.ident else "\u2014"
+    if not f.ident:
+        return "\u2014"
+    return _md_link(f.ident, f.ref_url or id_url(f.ident), 40)
 
 
 _VERSION_RE = re.compile(r"^v?\d[\w.\-+]*$")
@@ -276,7 +276,7 @@ def correct_file_cases(findings: Sequence["Finding"]) -> None:
 
 class Finding:
     __slots__ = ("category", "severity", "ident", "title", "location", "cvss",
-                 "floor", "file", "line", "fix", "cve", "version")
+                 "floor", "file", "line", "fix", "cve", "version", "ref_url")
 
     def __init__(
         self,
@@ -292,6 +292,7 @@ class Finding:
         fix: Optional[str] = None,
         cve: Optional[str] = None,
         version: Optional[str] = None,
+        ref_url: Optional[str] = None,
     ) -> None:
         self.category = category
         self.severity = severity  # raw; may be None or an unknown string
@@ -305,6 +306,7 @@ class Finding:
         self.fix = fix or ""        # fixed version(s) or fix state (dependencies)
         self.cve = cve or ""        # related CVE for an advisory (e.g. GHSA)
         self.version = version or ""  # installed library version, when known
+        self.ref_url = ref_url or ""  # neutral reference URL for the finding's id
 
     @property
     def effective_rank(self) -> int:
@@ -402,11 +404,20 @@ def parse_iac(data: Any) -> List[Finding]:
         target = c.get("Target", "")
         start = cause.get("StartLine")
         loc = target if provider in ("", target) else f"{provider}: {target}"
+        # Link the rule to its own non-Aqua reference (e.g. Docker docs, CIS)
+        # rather than the Aqua Vulnerability Database.
+        ref_url = ""
+        for u in (c.get("References") or c.get("references") or []):
+            if isinstance(u, str) and "aquasec" not in u.lower():
+                ref_url = u
+                break
+        resolution = c.get("Resolution") or c.get("resolution") or ""
         findings.append(Finding(
             "Misconfiguration", c.get("Severity") or c.get("severity"),
             c.get("ID"), c.get("Title") or c.get("Message"), loc, None, FLOOR_DEFAULT,
             file=clean_path(target),
-            line=start if isinstance(start, int) else None))
+            line=start if isinstance(start, int) else None, ref_url=ref_url,
+            fix=resolution))
 
     return findings
 
@@ -756,10 +767,22 @@ def _group_render(cat: str, items: Sequence["Finding"],
             return "| " + " | ".join(cells) + " |"
 
         return header, [row(f) for f in items]
-    header = ["| Severity | ID | Finding | Location |", "|:--|:--|:--|:--|"]
-    rows = [f"| {_sev_cell(f)} | {finding_id_cell(f)} | {sanitize(f.title, 100)} | "
-            f"{finding_location_cell(f)} |" for f in items]
-    return header, rows
+    # Misconfigurations, secrets, flaws. Add a Remediation column when the
+    # findings carry a resolution (misconfigurations do).
+    has_rem = any(f.fix for f in items)
+    cols = ["Severity", "ID", "Finding", "Location"]
+    if has_rem:
+        cols.append("Remediation")
+    header = ["| " + " | ".join(cols) + " |", "|" + ":--|" * len(cols)]
+
+    def grow(f: "Finding") -> str:
+        cells = [_sev_cell(f), finding_id_cell(f), sanitize(f.title, 100),
+                 finding_location_cell(f)]
+        if has_rem:
+            cells.append(sanitize(f.fix or "\u2014", 80))
+        return "| " + " | ".join(cells) + " |"
+
+    return header, [grow(f) for f in items]
 
 
 def _finding_row_grouped(f: "Finding") -> str:
