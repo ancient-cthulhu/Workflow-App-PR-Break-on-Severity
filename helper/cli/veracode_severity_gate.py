@@ -411,13 +411,13 @@ def parse_iac(data: Any) -> List[Finding]:
             if isinstance(u, str) and "aquasec" not in u.lower():
                 ref_url = u
                 break
-        resolution = c.get("Resolution") or c.get("resolution") or ""
+        message = c.get("Message") or c.get("message") or ""
         findings.append(Finding(
             "Misconfiguration", c.get("Severity") or c.get("severity"),
-            c.get("ID"), c.get("Title") or c.get("Message"), loc, None, FLOOR_DEFAULT,
+            c.get("ID"), c.get("Title") or message, loc, None, FLOOR_DEFAULT,
             file=clean_path(target),
             line=start if isinstance(start, int) else None, ref_url=ref_url,
-            fix=resolution))
+            fix=message))
 
     return findings
 
@@ -767,19 +767,20 @@ def _group_render(cat: str, items: Sequence["Finding"],
             return "| " + " | ".join(cells) + " |"
 
         return header, [row(f) for f in items]
-    # Misconfigurations, secrets, flaws. Add a Remediation column when the
-    # findings carry a resolution (misconfigurations do).
-    has_rem = any(f.fix for f in items)
+    # Misconfigurations, secrets, flaws. Add a Description column when the
+    # findings carry one (misconfigurations do). Kept long since these are
+    # typically short one-liners.
+    has_desc = any(f.fix for f in items)
     cols = ["Severity", "ID", "Finding", "Location"]
-    if has_rem:
-        cols.append("Remediation")
+    if has_desc:
+        cols.append("Description")
     header = ["| " + " | ".join(cols) + " |", "|" + ":--|" * len(cols)]
 
     def grow(f: "Finding") -> str:
-        cells = [_sev_cell(f), finding_id_cell(f), sanitize(f.title, 100),
+        cells = [_sev_cell(f), finding_id_cell(f), sanitize(f.title, 120),
                  finding_location_cell(f)]
-        if has_rem:
-            cells.append(sanitize(f.fix or "\u2014", 80))
+        if has_desc:
+            cells.append(sanitize(f.fix or "\u2014", 300))
         return "| " + " | ".join(cells) + " |"
 
     return header, [grow(f) for f in items]
