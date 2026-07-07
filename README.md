@@ -127,7 +127,7 @@ The workflow steps reinforce this: `set -euo pipefail`, the scan exit code is ca
 
 ## Gate Output
 
-The gate result is surfaced in three places: the job log, the GitHub job summary, and a check run on the scanned repository named "Veracode IaC Severity Gate" or "Veracode SCA Severity Gate". The check run carries the rendered severity table as its summary, so the result is visible directly in the pull request Checks panel, not only in the workflow run. Publishing the check run is best-effort and never changes the pass or fail verdict.
+The gate result is surfaced in three places: the job log and the GitHub job summary. The check run carries the rendered severity table as its summary, so the result is visible directly in the pull request Checks panel, not only in the workflow run. Publishing the check run is best-effort and never changes the pass or fail verdict.
 
 On every run the gate writes a count table and, when findings meet the threshold, a detail table:
 
